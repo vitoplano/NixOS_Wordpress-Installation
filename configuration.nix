@@ -19,7 +19,9 @@
   # networking.wireless.enable = true;  # Enables wireless support via wpa_supplicant.
 
   #Per dominio locale
-  networking.extraHosts = ''127.0.0.1 wordpress.local'';
+  networking.extraHosts = ''
+    127.0.0.1 wordpress.local
+  '';
 
   # Enable networking
   networking.networkmanager.enable = true;
@@ -97,55 +99,55 @@
   # List packages installed in system profile.
   environment.systemPackages = with pkgs; [
     wordpress
-    nginx
-    certbot
-    mariadb
-    php
+    openssl
+    gnused
+    curl
   ];
 
   # Nginx configuration
   services.nginx = {
     enable = true;
+    user = "nginx";
+    group = "nginx";
     virtualHosts."wordpress.local" = {
       root = "/var/www/wordpress";
-      locations."/" = {
-        index = "index.php";
-        extraConfig = ''
-          try_files $uri $uri/ /index.php?$args;
-        '';
-      };
-      locations."~ \\.php$" = {
-        extraConfig = ''
-          fastcgi_pass unix:/run/phpfpm/wordpress.sock;
-          fastcgi_index index.php;
-          include ${pkgs.nginx}/conf/fastcgi_params;
-          fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        '';
-      };
+      locations."~ \.php$".extraConfig = ''
+        fastcgi_pass unix:${config.services.phpfpm.pools.wordpress.socket};
+        fastcgi_index index.php;
+      '';
+      locations."/".index = "index.php index.html index.htm";
+      extraConfig = ''
+        location = /favicon.ico {
+          log_not_found off;
+          access_log off;
+        }
+        location = /robots.txt {
+          allow all;
+          log_not_found off;
+          access_log off;
+        }
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico)$ {
+          expires max;
+          log_not_found off;
+        }
+      '';
     };
   };
 
   # PHP-FPM configuration
-  services.phpfpm = {
-    phpPackage = pkgs.php;
-    pools.wordpress = {
-      user = "nginx";
-      group = "nginx";
-      settings = {
-        "listen.owner" = "nginx";
-        "listen.group" = "nginx";
-        "listen.mode" = "0660";
-        "pm" = "dynamic";
-        "pm.max_children" = 32;
-        "pm.start_servers" = 2;
-        "pm.min_spare_servers" = 2;
-        "pm.max_spare_servers" = 4;
-        "pm.max_requests" = 500;
-      };
-      phpOptions = ''
-        extension=${pkgs.php.extensions.mysqli}/lib/php/extensions/mysqli.so
-        extension=${pkgs.php.extensions.pdo_mysql}/lib/php/extensions/pdo_mysql.so
-      '';
+  services.phpfpm.pools.wordpress = {
+    user = "nginx";
+    group = "nginx";
+    settings = {
+      "listen.owner" = "nginx";
+      "listen.group" = "nginx";
+      "listen.mode" = "0660";
+      "pm" = "dynamic";
+      "pm.max_children" = 32;
+      "pm.start_servers" = 2;
+      "pm.min_spare_servers" = 2;
+      "pm.max_spare_servers" = 4;
+      "pm.max_requests" = 500;
     };
   };
 
@@ -154,18 +156,55 @@
     enable = true;
     package = pkgs.mariadb;
   };
+  
+  system.activationScripts.wordpressSetup = ''
+    # Verifica se l'utente del database esiste già
+  USER_EXISTS=$(${pkgs.mariadb}/bin/mysql -s -N -e "SELECT EXISTS(SELECT 1 FROM mysql.user WHERE user = 'wordpress' AND host = 'localhost')")
+  if [ "$USER_EXISTS" = "1" ]; then
+    echo "DB USER ALREADY EXIST!! STOPPING BULDING.."
+    exit 1
+  fi
+    mkdir -p /var/www/wordpress
+    cp -r ${pkgs.wordpress}/share/wordpress/* /var/www/wordpress/
+    chown -R nginx:nginx /var/www/wordpress
 
-  # WordPress installation script
-  system.activationScripts = {
-    installWordPress = ''
-      mkdir -p /var/www/wordpress
-      rm -rf /var/www/wordpress/*
-      cp -r ${pkgs.wordpress}/share/wordpress/* /var/www/wordpress/
-      chown -R nginx:nginx /var/www/wordpress
-      find /var/www/wordpress -type d -exec chmod 755 {} \;
-      find /var/www/wordpress -type f -exec chmod 644 {} \;
+    # Generazione password casuale per l'utente MySQL
+    DB_PASSWORD=$(${pkgs.openssl}/bin/openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | fold -w 12 | head -n 1)
+    ${pkgs.mariadb}/bin/mysql -e "CREATE DATABASE IF NOT EXISTS wordpress1;"
+    ${pkgs.mariadb}/bin/mysql -e "CREATE USER IF NOT EXISTS 'wordpress'@'localhost' IDENTIFIED BY '$DB_PASSWORD';"
+    ${pkgs.mariadb}/bin/mysql -e "GRANT ALL PRIVILEGES ON wordpress1.* TO 'wordpress'@'localhost';"
+    ${pkgs.mariadb}/bin/mysql -e "FLUSH PRIVILEGES;"
+
+    # Configurazione di wp-config.php
+    cp /var/www/wordpress/wp-config-sample.php /var/www/wordpress/wp-config.php
+    ${pkgs.gnused}/bin/sed -i "s/database_name_here/wordpress1/" /var/www/wordpress/wp-config.php
+    ${pkgs.gnused}/bin/sed -i "s/username_here/wordpress/" /var/www/wordpress/wp-config.php
+    ${pkgs.gnused}/bin/sed -i "s/password_here/$DB_PASSWORD/" /var/www/wordpress/wp-config.php
+    ${pkgs.gnused}/bin/sed -i "s/localhost/localhost/" /var/www/wordpress/wp-config.php
+
+    #  # Generazione delle chiavi di sicurezza
+    #   KEYS=$(${pkgs.curl}/bin/curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+    #   ${pkgs.gnused}/bin/sed -i "/put your unique phrase here/d" /var/www/wordpress/wp-config.php
+    #   echo "$KEYS" >> /var/www/wordpress/wp-config.php
+
+    #  FS_METHOD
+    echo "define('FS_METHOD', 'direct');" >> /var/www/wordpress/wp-config.php
+
+   chown -R nginx:nginx /var/www/wordpress
+   chmod -R 755 /var/www/wordpress
+
+  '';
+
+ # Create PHP-FPM socket directory with correct permissions
+  system.activationScripts.phpfpmSocketDir = {
+    text = ''
+      mkdir -p /run/phpfpm
+      chown nginx:nginx /run/phpfpm
+      chmod 755 /run/phpfpm
     '';
+    deps = [];
   };
+
 
   # Enable the OpenSSH daemon.
   services.openssh.enable = true;
